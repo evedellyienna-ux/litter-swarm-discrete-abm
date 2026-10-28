@@ -1,0 +1,390 @@
+;; =====================================================================
+;; Agents:  robots (move, sense, carry), litter (items to collect),
+;;          pings (temporary signals broadcast by robots)
+;; Space:   2D grid park. Patches only store fixed terrain
+;;          (grass, obstacle, base). Time advances in discrete ticks.
+;; No sliders or switches are needed for this simulation
+;; =====================================================================
+
+globals [
+  ;; ---- settings (can edit them in set-defaults) ----
+  num-robots capacity sense-radius detect-prob comm-radius
+  signal-lifetime battery-drain charge-rate wander-angle speed
+  num-obstacles num-clusters cluster-size cluster-radius num-scattered
+  signaling? use-battery? max-ticks
+  ;; ---- model variables ----
+  base-x base-y base-patch base-patches
+  total-litter delivered finish-tick
+]
+
+breed [ pings ping ]
+breed [ robots robot ]
+breed [ litters litter ]
+
+patches-own [ obstacle? base? ]
+robots-own  [ state carrying battery target ]
+;; state is one of: "search" "collect" "return" "charge" "dead"
+pings-own   [ age ]
+
+to set-defaults
+  set num-robots 8          ;; robots in the swarm
+  set capacity 3            ;; litter items a robot carries per trip
+  set sense-radius 3        ;; camera range (patches)
+  set detect-prob 0.9       ;; chance the sensor notices litter in range
+  set comm-radius 8         ;; range of the short-range signal (patches)
+  set signal-lifetime 40    ;; ticks a signal lasts
+  set battery-drain 0.3     ;; battery used per tick (battery starts at 100)
+  set charge-rate 5         ;; battery gained per tick at the base
+  set wander-angle 40       ;; how much a searching robot turns each tick
+  set speed 1               ;; patches moved per tick
+  set num-obstacles 8       ;; trees / benches
+  set num-clusters 3        ;; litter clusters
+  set cluster-size 15       ;; items per cluster
+  set cluster-radius 3      ;; spread of a cluster (patches)
+  set num-scattered 30      ;; individually scattered items
+  set signaling? true       ;; swarm signalling on/off
+  set use-battery? true     ;; battery on/off
+  set max-ticks 3000        ;; safety limit used by compare
+end
+
+;; ---------------------------------------------------------------------
+;; PART A - ENVIRONMENT AND LITTER DISTRIBUTION
+;; ---------------------------------------------------------------------
+
+to setup
+  clear-all
+  set-defaults
+  set base-x min-pxcor + 3
+  set base-y min-pycor + 3
+  ask patches [ set obstacle? false set base? false ]
+  setup-base
+  setup-obstacles
+  setup-litter
+  setup-robots
+  set delivered 0
+  set finish-tick -1
+  recolor-patches
+  reset-ticks
+end
+
+to setup-base
+  set base-patch patch base-x base-y
+  set base-patches patches with [ abs (pxcor - base-x) <= 1 and abs (pycor - base-y) <= 1 ]
+  ask base-patches [ set base? true ]
+end
+
+;; trees / benches - small blobs of blocked patches, away from the base
+to setup-obstacles
+  repeat num-obstacles [
+    let c one-of patches with [ distance base-patch > 6 and not obstacle? ]
+    if c != nobody [
+      ask c [
+        ask patches in-radius (0.5 + random-float 1.5) [
+          if not base? [ set obstacle? true ]
+        ]
+      ]
+    ]
+  ]
+end
+
+;; a patch where litter may be placed
+to-report valid-spot?
+  report (not obstacle?) and (not base?) and (distance base-patch > 4)
+end
+
+;; clusters form next to obstacles (benches / bins)
+to-report pick-cluster-center
+  let c nobody
+  if any? patches with [ obstacle? ] [
+    let anchor one-of patches with [ obstacle? ]
+    set c [ one-of patches in-radius 4 with [ valid-spot? ] ] of anchor
+  ]
+  if c = nobody [ set c one-of patches with [ valid-spot? ] ]
+  report c
+end
+
+to spawn-litter [ p ]
+  create-litters 1 [
+    set shape "circle"
+    set color red
+    set size 0.7
+    move-to p
+    setxy (xcor + (random-float 0.6) - 0.3) (ycor + (random-float 0.6) - 0.3)
+  ]
+end
+
+to setup-litter
+  ;; 1) clustered litter
+  repeat num-clusters [
+    let c pick-cluster-center
+    if c != nobody [
+      let cands [ patches in-radius cluster-radius with [ valid-spot? ] ] of c
+      if any? cands [
+        repeat cluster-size [ spawn-litter one-of cands ]
+      ]
+    ]
+  ]
+  ;; 2) scattered litter anywhere else
+  let spots patches with [ valid-spot? ]
+  repeat num-scattered [ spawn-litter one-of spots ]
+  set total-litter count litters
+end
+
+to setup-robots
+  create-robots num-robots [
+    set shape "car"
+    set size 1.6
+    set label-color black
+    move-to one-of base-patches
+    set heading random 360
+    set state "search"
+    set carrying 0
+    set battery 100
+    set target nobody
+    update-color
+  ]
+end
+
+to recolor-patches
+  ask patches [
+    ifelse base? [ set pcolor yellow ] [
+      ifelse obstacle? [ set pcolor green - 2 ] [ set pcolor lime + 3 ]
+    ]
+  ]
+end
+
+;; ---------------------------------------------------------------------
+;; MAIN LOOP
+;; ---------------------------------------------------------------------
+
+to go
+  if finished? [
+    if finish-tick < 0 [ set finish-tick ticks ]
+    stop
+  ]
+  ask robots [ robot-step ]
+  ask pings [ age-ping ]
+  tick
+end
+
+to-report finished?
+  if all? robots [ state = "dead" ] [ report true ]
+  report (not any? litters) and (not any? robots with [ carrying > 0 and state != "dead" ])
+end
+
+;; one sense - plan - act cycle for one robot
+to robot-step
+  if state = "dead" [ stop ]
+  if state = "charge" [ recharge stop ]
+
+  if use-battery? [
+    set battery battery - battery-drain
+    if battery <= 0 [
+      set battery 0
+      set state "dead"
+      update-color
+      stop
+    ]
+  ]
+
+  ifelse state = "search" [ search ] [
+    ifelse state = "collect" [ collect ] [
+      if state = "return" [ go-home ]
+    ]
+  ]
+  update-color
+end
+
+;; ---------------------------------------------------------------------
+;; PART B - SEARCHING AND COLLECTION
+;; PART C - SIGNALLING
+;; ---------------------------------------------------------------------
+
+to search
+  ;; if full, battery low, or nothing left to find, then head home
+  if carrying >= capacity or low-battery? or (carrying > 0 and not any? litters) [
+    set state "return"
+    go-home
+    stop
+  ]
+
+  ;; sense: litter within the camera range (the sensor can miss it)
+  let seen litters in-radius sense-radius
+  if any? seen and (random-float 1 < detect-prob) [
+    set target min-one-of seen [ distance myself ]
+    set state "collect"
+    collect
+    stop
+  ]
+
+  ;; PART C - nothing in view: follow the nearest signal, if any
+  if signaling? [
+    let sig min-one-of pings in-radius comm-radius [ distance myself ]
+    if sig != nobody [
+      if distance sig > sense-radius [
+        face sig
+        move-step
+        stop
+      ]
+    ]
+  ]
+
+  wander
+end
+
+to wander
+  rt ((random-float wander-angle) - (wander-angle / 2))
+  move-step
+end
+
+to collect
+  if not is-litter? target [          ;; litter already taken by another robot
+    set target nobody
+    set state "search"
+    stop
+  ]
+  ifelse distance target <= speed [
+    pick-up
+  ] [
+    face target
+    move-step
+  ]
+end
+
+to pick-up
+  move-to target
+  ask target [ die ]                  ;; litter is removed from the environment
+  set target nobody
+  set carrying carrying + 1
+  set state "search"
+  ;; PART C - broadcast a temporary signal where litter was found
+  if signaling? [
+    hatch-pings 1 [
+      set shape "circle"
+      set size (2 * comm-radius)
+      set color lput 65 (extract-rgb cyan)
+      set age 0
+    ]
+  ]
+end
+
+;; signals fade and disappear
+to age-ping
+  set age age + 1
+  ifelse age >= signal-lifetime [
+    die
+  ] [
+    set color lput ((round (50 * (1 - age / signal-lifetime))) + 15) (extract-rgb cyan)
+  ]
+end
+
+;; ---------------------------------------------------------------------
+;; PART D - RETURN TO BASE (+ battery)
+;; ---------------------------------------------------------------------
+
+to go-home
+  ifelse [ base? ] of patch-here [
+    unload
+  ] [
+    face base-patch
+    move-step
+  ]
+end
+
+to unload
+  set delivered delivered + carrying
+  set carrying 0
+  ifelse use-battery? and (battery < 100) [
+    set state "charge"
+  ] [
+    set state "search"
+    set heading random 360
+  ]
+end
+
+to recharge
+  set battery min (list 100 (battery + charge-rate))
+  if battery >= 100 [
+    set state "search"
+    set heading random 360
+  ]
+end
+
+;; turn back while there is still enough battery to reach the base
+to-report low-battery?
+  if not use-battery? [ report false ]
+  report battery < (distance base-patch) * battery-drain * 1.5 + 10
+end
+
+;; ---------------------------------------------------------------------
+;; MOVEMENT AND COLLISION AVOIDANCE
+;; ---------------------------------------------------------------------
+
+to-report can-go?
+  let p patch-ahead speed
+  if p = nobody [ report false ]             ;; edge of the map
+  if [ obstacle? ] of p [ report false ]     ;; tree / bench
+  if [ base? ] of p [ report true ]          ;; the base may be crowded
+  report not any? other robots-on p          ;; another robot in the way
+end
+
+to move-step
+  let tries 0
+  while [ tries < 8 and not can-go? ] [
+    rt (one-of [ -1 1 ]) * (45 + random 90)
+    set tries tries + 1
+  ]
+  if can-go? [ fd speed ]
+end
+
+;; ---------------------------------------------------------------------
+;; DISPLAY, REPORTERS AND EXPERIMENT
+;; ---------------------------------------------------------------------
+
+to update-color
+  ifelse state = "search" [ set color blue ] [
+    ifelse state = "collect" [ set color orange ] [
+      ifelse state = "return" [ set color magenta ] [
+        ifelse state = "charge" [ set color violet ] [ set color gray ]
+      ]
+    ]
+  ]
+  set label ifelse-value (carrying > 0) [ carrying ] [ "" ]
+end
+
+to-report litter-left
+  report count litters
+end
+
+to-report clear-time
+  report finish-tick
+end
+
+
+;; ---------------------------------------------------------------------
+;; FOR REPETITION
+;; ---------------------------------------------------------------------
+to compare [ trials ]
+  no-display
+  foreach [ true false ] [ s ->
+    let times []
+    let timeouts 0
+    let dead-total 0
+    repeat trials [
+      setup
+      set signaling? s
+      while [ not finished? and ticks < max-ticks ] [ go ]
+      set times lput ticks times
+      if not finished? [ set timeouts timeouts + 1 ]
+      set dead-total dead-total + count robots with [ state = "dead" ]
+    ]
+    let sd 0
+    if trials > 1 [ set sd standard-deviation times ]
+    print (word "signaling? = " s
+      "  mean = " (precision mean times 1)
+      "  sd = " (precision sd 1)
+      "  timeouts = " timeouts "/" trials
+      "  dead robots per run = " (precision (dead-total / trials) 2))
+  ]
+  display
+end
